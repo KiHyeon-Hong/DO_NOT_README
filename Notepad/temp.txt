@@ -1,0 +1,124 @@
+import asyncio
+from mavsdk import System
+from mavsdk.telemetry import FlightMode, LandedState # LandedState 임포트
+
+# --- 상태 저장을 위한 전역 변수 ---
+current_flight_mode = None
+mission_progress = None
+is_mission_finished = False
+landed_state = None # 착륙 상태 추적
+
+# --- 각 상태 구독 함수 ---
+
+async def monitor_flight_mode(drone):
+    """비행 모드를 구독하고 업데이트합니다."""
+    global current_flight_mode
+    async for flight_mode in drone.telemetry.flight_mode():
+        if current_flight_mode != flight_mode:
+            print(f"비행 모드 변경됨: {flight_mode}")
+            current_flight_mode = flight_mode
+
+async def monitor_mission_progress(drone):
+    """미션 진행 상태를 구독하고 업데이트합니다."""
+    global mission_progress, is_mission_finished
+    async for progress in drone.mission.mission_progress():
+        if mission_progress != progress:
+            # print(f"미션 진행: {progress.current}/{progress.total}")
+            mission_progress = progress
+            # 미션 진행이 업데이트되면, 완료 상태는 False여야 함
+            if is_mission_finished:
+                print("미션 진행 업데이트 감지, 완료 상태 초기화 (False).")
+                is_mission_finished = False
+
+async def monitor_mission_finished(drone):
+    """미션 완료 여부를 구독하고 업데이트합니다."""
+    global is_mission_finished
+    # is_mission_finished()는 미션이 성공적으로 완료되었을 때 True를 반환합니다.
+    async for finished in drone.mission.is_mission_finished():
+        if is_mission_finished != finished:
+            print(f"미션 완료 상태 변경됨: {finished}")
+            is_mission_finished = finished
+
+async def monitor_landed_state(drone):
+    """착륙 상태를 구독하고 업데이트합니다."""
+    global landed_state
+    async for state in drone.telemetry.landed_state():
+         if landed_state != state:
+             print(f"착륙 상태 변경됨: {state}")
+             landed_state = state
+
+# --- 주기적 상태 확인 및 출력 함수 ---
+
+async def check_status_periodically():
+    """주기적으로 드론 상태를 확인하고 종합하여 출력합니다."""
+    global current_flight_mode, mission_progress, is_mission_finished, landed_state
+    while True:
+        print("--- 상태 확인 ---")
+        status_message = "상태: 정보 대기 중..." # 기본 메시지
+
+        # 1순위: MAVSDK에서 미션 완료 신호가 왔는지 확인
+        if is_mission_finished:
+            status_message = "상태: 미션 완료됨"
+            # 부가 정보: 착륙 상태 확인
+            if landed_state == LandedState.ON_GROUND:
+                 status_message += " (착륙 완료)"
+            elif landed_state == LandedState.LANDING:
+                 status_message += " (착륙 중)"
+
+        # 2순위: 미션 완료 신호는 없지만, 비행 모드가 MISSION인지 확인
+        elif current_flight_mode == FlightMode.MISSION:
+            if mission_progress:
+                status_message = f"상태: 미션 수행 중 ({mission_progress.current}/{mission_progress.total})"
+            else:
+                status_message = "상태: 미션 수행 중 (진행 정보 대기 중...)"
+
+        # 3순위: 미션 완료도 아니고 미션 수행 모드도 아니지만, 착륙 상태인지 확인
+        elif landed_state == LandedState.ON_GROUND:
+             # 비행 모드 정보가 있다면 함께 표시
+             mode_info = f"(현재 모드: {current_flight_mode})" if current_flight_mode else ""
+             status_message = f"상태: 착륙 완료 {mode_info}"
+
+        # 4순위: 그 외 비행 모드 (미션도 아니고 착륙도 아님)
+        elif current_flight_mode:
+            status_message = f"상태: 미션 외 다른 동작 중 (현재 모드: {current_flight_mode})"
+            if landed_state == LandedState.LANDING:
+                 status_message += " (착륙 중)" # 예: RTL 중 착륙 단계
+
+        # 5순위: 위의 모든 조건에 해당하지 않는 초기 상태 등
+        # status_message는 기본값 "상태: 정보 대기 중..." 유지됨
+
+        print(status_message)
+        await asyncio.sleep(1) # 1초 대기 (주기 조절 가능)
+
+
+# --- 메인 실행 함수 ---
+
+async def run():
+    """메인 실행 함수"""
+    drone = System()
+    # 연결 주소 설정 (SITL: udp://:14540, 실제 드론: serial:///dev/ttyACM0:57600 등)
+    await drone.connect(system_address="udp://:14540")
+
+    print("드론 연결 대기 중...")
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print(f"드론 발견됨!")
+            break
+    else: # 루프가 break 없이 끝나면 (연결 실패)
+        print("드론에 연결할 수 없습니다.")
+        return # 프로그램 종료
+
+    print("상태 구독 및 주기적 확인 시작...")
+
+    # 각 상태 구독을 별도의 Task로 동시에 실행
+    asyncio.create_task(monitor_flight_mode(drone))
+    asyncio.create_task(monitor_mission_progress(drone))
+    asyncio.create_task(monitor_mission_finished(drone))
+    asyncio.create_task(monitor_landed_state(drone))
+
+    # 주기적 상태 확인 태스크 실행 (이 함수는 종료되지 않음)
+    await check_status_periodically()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
